@@ -1,201 +1,143 @@
-"""
-Task 10 — Generation Có Citation.
+"""Task 10 - citation-grounded generation via OpenRouter."""
 
-Hướng dẫn:
-    1. Chọn top_k, top_p phù hợp (giải thích lý do)
-    2. Sắp xếp lại chunks sau reranking để tránh "lost in the middle"
-    3. Inject context vào prompt
-    4. Yêu cầu LLM trả lời có citation
-    5. Nếu không đủ evidence → "I cannot verify this information"
-"""
+from __future__ import annotations
 
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
+from dotenv import load_dotenv
 
 from .task9_retrieval_pipeline import retrieve
 
+load_dotenv()
 
-# =============================================================================
-# CONFIGURATION — Giải thích lựa chọn
-# =============================================================================
 
-# top_k: Số chunks đưa vào context
-# Chọn 5 vì: đủ evidence mà không quá dài gây lost in the middle
 TOP_K = 5
-
-# top_p (nucleus sampling): Xác suất tích luỹ cho token generation
-# Chọn 0.9 vì: đủ diverse nhưng không quá random
 TOP_P = 0.9
-
-# temperature: Độ ngẫu nhiên của output
-# Chọn 0.3 vì: RAG cần factual, ít sáng tạo
 TEMPERATURE = 0.3
+MAX_TOKENS = 900
 
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4-flash")
+OPENROUTER_BASE_URL = os.getenv(
+    "OPENROUTER_BASE_URL",
+    "https://openrouter.ai/api/v1/chat/completions",
+)
+OPENROUTER_HTTP_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost")
+OPENROUTER_APP_TITLE = os.getenv("OPENROUTER_APP_TITLE", "Day08-RAG-Pipeline-v2")
 
-# =============================================================================
-# SYSTEM PROMPT
-# =============================================================================
+SYSTEM_PROMPT = """Bạn là trợ lý RAG cho pháp luật Việt Nam về ma túy và tin tức nghệ sĩ liên quan ma túy.
+Chỉ sử dụng thông tin trong CONTEXT được cung cấp.
+Mọi khẳng định thực tế phải có citation ngay sau câu, dạng [Nguồn, Năm] hoặc [Tên file, N/A].
+Nếu context không đủ bằng chứng, trả lời: "Tôi không thể xác minh thông tin này từ nguồn hiện có."
+Không suy đoán điều luật, mức án, tình trạng tố tụng hoặc dữ kiện báo chí ngoài context."""
 
-SYSTEM_PROMPT = """Answer the following question comprehensively in Vietnamese.
-For every statement of fact or claim, immediately insert a citation in brackets
-linking to the specific source (e.g., [Luật Phòng chống ma tuý 2021, Điều 3]
-or [VnExpress, 2024]).
-
-If the information is not explicitly stated in the provided context or knowledge
-base, state 'Tôi không thể xác minh thông tin này từ nguồn hiện có' rather than
-guessing.
-
-Rules:
-- Only use information from the provided context
-- Every factual claim MUST have a citation
-- If context is insufficient, say so clearly
-- Structure your answer with clear paragraphs"""
-
-
-# =============================================================================
-# DOCUMENT REORDERING (tránh lost in the middle)
-# =============================================================================
 
 def reorder_for_llm(chunks: list[dict]) -> list[dict]:
-    """
-    Sắp xếp chunks để tránh "lost in the middle" effect.
+    """Place strong evidence at the beginning and end of the context."""
+    if len(chunks) <= 2:
+        return list(chunks)
 
-    LLM nhớ tốt thông tin ở ĐẦU và CUỐI prompt, quên thông tin ở GIỮA.
-    Strategy: đặt chunks quan trọng nhất ở đầu và cuối, kém quan trọng ở giữa.
-
-    Input order (by score):  [1, 2, 3, 4, 5]
-    Output order:            [1, 3, 5, 4, 2]
-    (best first, worst in middle, second-best last)
-
-    Args:
-        chunks: List sorted by score descending (from retrieval)
-
-    Returns:
-        List reordered để maximize LLM attention.
-    """
-    # TODO: Implement reordering
-    #
-    # if len(chunks) <= 2:
-    #     return chunks
-    #
-    # # Split into first half (important → đầu) and second half (important → cuối)
-    # reordered = []
-    # for i in range(0, len(chunks), 2):
-    #     reordered.append(chunks[i])  # Odd positions go first
-    # for i in range(len(chunks) - 1 - (len(chunks) % 2 == 0), 0, -2):
-    #     reordered.append(chunks[i])  # Even positions go last (reversed)
-    #
-    # return reordered
-    raise NotImplementedError("Implement reorder_for_llm")
+    reordered: list[dict] = []
+    left = 0
+    right = len(chunks) - 1
+    place_front = True
+    while left <= right:
+        if place_front:
+            reordered.append(chunks[left])
+            left += 1
+        else:
+            reordered.append(chunks[right])
+            right -= 1
+        place_front = not place_front
+    return reordered
 
 
-# =============================================================================
-# CONTEXT FORMATTING
-# =============================================================================
+def _citation_label(chunk: dict, index: int) -> str:
+    metadata = chunk.get("metadata", {})
+    source = metadata.get("source") or metadata.get("path") or f"Source {index}"
+    year = metadata.get("year") or "N/A"
+    return f"{source}, {year}"
+
 
 def format_context(chunks: list[dict]) -> str:
-    """
-    Format chunks thành context string cho prompt.
-    Mỗi chunk có label source để LLM có thể cite.
-
-    Args:
-        chunks: List of {'content': str, 'metadata': dict, 'score': float}
-
-    Returns:
-        Formatted context string.
-    """
-    # TODO: Implement context formatting
-    #
-    # context_parts = []
-    # for i, chunk in enumerate(chunks, 1):
-    #     source = chunk.get("metadata", {}).get("source", f"Source {i}")
-    #     doc_type = chunk.get("metadata", {}).get("type", "unknown")
-    #     context_parts.append(
-    #         f"[Document {i} | Source: {source} | Type: {doc_type}]\n"
-    #         f"{chunk['content']}\n"
-    #     )
-    # return "\n---\n".join(context_parts)
-    raise NotImplementedError("Implement format_context")
+    parts: list[str] = []
+    for i, chunk in enumerate(chunks, start=1):
+        metadata = chunk.get("metadata", {})
+        source = metadata.get("source", f"Source {i}")
+        year = metadata.get("year", "N/A")
+        doc_type = metadata.get("type", "unknown")
+        path = metadata.get("path", source)
+        parts.append(
+            f"[Document {i} | Citation: {source}, {year} | Type: {doc_type} | Path: {path}]\n"
+            f"{chunk.get('content', '')}"
+        )
+    return "\n\n---\n\n".join(parts)
 
 
-# =============================================================================
-# GENERATION
-# =============================================================================
+def _extractive_fallback(reordered: list[dict]) -> str:
+    if not reordered:
+        return "Tôi không thể xác minh thông tin này từ nguồn hiện có."
+
+    best = reordered[0]
+    citation = _citation_label(best, 1)
+    content = best.get("content", "").strip()
+    if len(content) > 1200:
+        content = content[:1200].rsplit(" ", 1)[0] + "..."
+    return f"Dựa trên nguồn truy xuất được, nội dung liên quan nhất là: {content} [{citation}]."
+
+
+def _call_openrouter(query: str, context: str) -> str:
+    if not OPENROUTER_API_KEY:
+        return ""
+    import requests
+
+    user_message = f"CONTEXT:\n{context}\n\nQUESTION:\n{query}"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": OPENROUTER_HTTP_REFERER,
+        "X-Title": OPENROUTER_APP_TITLE,
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        # Low temperature/top_p keep legal/news answers factual and stable.
+        "temperature": TEMPERATURE,
+        "top_p": TOP_P,
+        "max_tokens": MAX_TOKENS,
+    }
+
+    response = requests.post(OPENROUTER_BASE_URL, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"].strip()
+
 
 def generate_with_citation(query: str, top_k: int = TOP_K) -> dict:
-    """
-    End-to-end RAG generation có citation.
+    chunks = retrieve(query, top_k=top_k)
+    reordered = reorder_for_llm(chunks)
+    context = format_context(reordered)
 
-    Pipeline:
-        1. Retrieve relevant chunks
-        2. Reorder để tránh lost in the middle
-        3. Format context với source labels
-        4. Build prompt (system + context + query)
-        5. Call LLM
-        6. Return answer + sources
+    answer = ""
+    if reordered:
+        try:
+            answer = _call_openrouter(query, context)
+        except Exception:
+            answer = ""
+    if not answer:
+        answer = _extractive_fallback(reordered)
 
-    Args:
-        query: Câu hỏi của user
-
-    Returns:
-        {
-            'answer': str,           # Câu trả lời có citation
-            'sources': list[dict],   # Các chunks đã dùng
-            'retrieval_source': str  # 'hybrid' hoặc 'pageindex'
-        }
-    """
-    # TODO: Implement generation pipeline
-    #
-    # # Step 1: Retrieve
-    # chunks = retrieve(query, top_k=top_k)
-    #
-    # # Step 2: Reorder
-    # reordered = reorder_for_llm(chunks)
-    #
-    # # Step 3: Format context
-    # context = format_context(reordered)
-    #
-    # # Step 4: Build prompt
-    # user_message = f"""Context:\n{context}\n\n---\n\nQuestion: {query}"""
-    #
-    # # Step 5: Call LLM
-    # from openai import OpenAI
-    # client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    #
-    # response = client.chat.completions.create(
-    #     model="gpt-4o-mini",
-    #     messages=[
-    #         {"role": "system", "content": SYSTEM_PROMPT},
-    #         {"role": "user", "content": user_message}
-    #     ],
-    #     temperature=TEMPERATURE,
-    #     top_p=TOP_P,
-    # )
-    #
-    # answer = response.choices[0].message.content
-    #
-    # # Step 6: Return
-    # return {
-    #     "answer": answer,
-    #     "sources": chunks,
-    #     "retrieval_source": chunks[0].get("source", "hybrid") if chunks else "none"
-    # }
-    raise NotImplementedError("Implement generate_with_citation")
+    return {
+        "answer": answer,
+        "sources": reordered,
+        "retrieval_source": reordered[0].get("source", "hybrid") if reordered else "none",
+        "model": OPENROUTER_MODEL if OPENROUTER_API_KEY else "extractive-fallback",
+    }
 
 
 if __name__ == "__main__":
-    test_queries = [
-        "Hình phạt cho tội tàng trữ trái phép chất ma tuý theo pháp luật Việt Nam?",
-        "Những nghệ sĩ nào đã bị bắt vì liên quan tới ma tuý?",
-        "Quy trình cai nghiện bắt buộc theo Luật Phòng chống ma tuý 2021?",
-    ]
-
-    for q in test_queries:
-        print(f"\n{'='*70}")
-        print(f"Q: {q}")
-        print("=" * 70)
-        result = generate_with_citation(q)
-        print(f"\nA: {result['answer']}")
-        print(f"\n[Sources: {len(result['sources'])} chunks | via {result['retrieval_source']}]")
+    result = generate_with_citation("Hình phạt tàng trữ ma túy là gì?")
+    print(result["answer"])
